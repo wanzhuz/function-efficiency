@@ -1,0 +1,269 @@
+---
+title: "Coding Project 5"
+author: "Wanzhu Zheng"
+date: "2023-06-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rvest)
+library(xml2)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(raw)
+library(stringr)
+library(readr)
+```
+
+## Read Table from W3Schools
+
+```{r}
+html = read_html("https://www.w3schools.com/tags/ref_urlencode.ASP")
+tbls_nodes = html_nodes(html, "table")
+ 
+tbls_content = tbls_nodes %>% html_table(fill=TRUE)
+tbls = as.data.frame(tbls_content[[1]])
+tbl = tbls[c(1,3)]
+head(tbl)
+```
+
+We notice that R cannot deal with particular %-encodings.\
+For example:
+
+```{r}
+tbl[109:114, ]
+```
+
+We deal with this by omitting those rows.
+
+```{r}
+mapping =  tbl[-c(96, 110, 112, 113, 126, 129, 142), ]
+head(mapping)
+```
+
+## Create Sample Strings
+
+```{r}
+source("preallocated.R")
+source("vectorized.R")
+source("my_funs.R")
+source("words.R")
+source("times.R")
+```
+
+We write a create_n_str function that samples letters, numbers, and
+UTF-8. It takes in an integer n and outputs n sample strings.
+```{r eval=FALSE}
+create_n_str = function(n) {
+  str_len = sample(1:200000, n, replace = TRUE)
+  chars = sample(c(letters, 0:9, mapping$`From UTF-8`), sum(str_len), replace=TRUE)
+  tapply(chars, rep(1:n, str_len), paste, collapse="")
+}
+```
+
+As expected, when we input n = 1, the function returns 1 string and if
+we input n = 25, the function returns 25 strings.
+
+```{r}
+length(create_n_str(1))
+length(create_n_str(25))
+```
+
+## Run-time Performance as a Function of Size
+
+We write another create_str function that samples letters, numbers, and
+UTF-8.\
+It takes in an integer n and outputs a string of length n.
+
+```{r eval=FALSE}
+create_str = function(n) {
+  str_len = n
+  chars = sample(c(letters, 0:9, mapping$`From UTF-8`), str_len, replace=TRUE)
+  paste(chars, collapse="")
+}
+```
+
+We want to see how URLdecode() compares to itself at different values of
+n passed into create_str. We first create a list of sample strings
+
+```{r}
+words = readRDS("words.rds")
+```
+
+Then, we use system.time() to time the runtime of URLdecode() for
+strings ranging from length 1 to 200K.
+
+```{r}
+tm0 = readRDS("tm0.rds")
+```
+
+Plot Size vs. Run-time
+
+```{r}
+tm0_df = data.frame(size=i, time=tm0)
+
+ggplot(data=tm0_df, aes(x=size, y=time, group=1)) +
+  geom_line(color="red4")+
+  geom_point()
+```
+
+Notice that there is a quadratic relationship between string size and
+runtime.
+
+## Pre-allocated Version of URLdecode()
+
+We modify the URLdecode() function to use preallocation which will give
+us a faster runtime.
+
+```{r eval=FALSE}
+preallocated = function (URL) {
+  vapply(URL, function(URL) {
+    x = charToRaw(URL)
+    pc = charToRaw("%")
+    out = raw(length(x))
+    i = 1L
+    while (i <= length(x)) {
+      if (x[i] != pc) {
+        out[i] = x[i]
+        i = i + 1L
+      }
+      else {
+        y = as.integer(x[i+1L:2L])
+        y[y > 96L] = y[y > 96L] - 32L
+        y[y > 57L] = y[y > 57L] - 7L
+        y = sum((y - 48L) * c(16L, 1L))
+        out[i] = as.raw(as.character(y))
+        i = i + 3L
+      }
+    }
+    rawToChar(out[out != 00])
+  }, character(1), USE.NAMES = FALSE)
+}
+```
+
+### Verification
+
+In this section, we verify that our output from preallocated() is the
+same as our output from URLdecode(). In order to do so, we check that
+preallocated() returns the same content as URLdecode() for all test
+strings:
+
+```{r}
+for (i in words) {
+  stopifnot(preallocated(i) == URLdecode(i))
+}
+```
+
+Since no error was returned, we know that all three conditions have been
+met and our preallocated() function returns the same character string as
+URLdecode().
+
+## Vectorized Version of URLdecode()
+
+```{r eval=FALSE}
+vectorized = function(URL) {
+  x = charToRaw(URL)
+  pc = charToRaw("%")
+  out = raw(length(x))
+  
+  pcidx = unlist(gregexpr("%", URL))
+  pct = rep(pcidx, each=2)
+  
+  pc_pair = pct + c(1,2)
+  y = as.integer(x[pc_pair])
+  y[y > 96L] = y[y > 96L] - 32L
+  y[y > 57L] = y[y > 57L] - 7L
+  
+  proc = (y - 48L) * c(16L, 1L)
+  m = matrix(proc, ncol=2, byrow=TRUE)
+  sum = rowSums(m)
+  out[pcidx] = as.raw(as.character(sum))
+  
+  non_pc = c(pcidx, pc_pair)
+  nonidx = setdiff(1:length(x), non_pc)
+  out[nonidx] = x[nonidx]
+  
+  return(rawToChar(out[out != 00]))
+}
+```
+
+## Debugging
+### Preallocated Version
+* Warning: Exists 00 characters when converting to string
+    + There was a warning message that told me my final output string had
+    00 characters when I converted rawToChar() for my final output string.
+    + In preallocation, we are passing %-encoded pairs into the index of
+    the "%" in the string. Therefore, there will be lots of empty raw characters
+    since the two indices after "%" will not be filled. I solved this by adding
+    rawToChar(out[out != 00]) at the end of the function. This returns the
+    indices in out that are not 00.
+
+### Vectorized Version
+* Warning: y = as.integer(x[pc_idx+1L:2L])
+    + This gave a warning message stating that the list size was not correct.
+    + I solved this by using the rep() function to replicate each
+    value of pc_idx twice. Then, I added c(1, 2) to the indices. This gives me
+    the next two indices of characters after %.
+* Error: Incorrect sums
+    + I wasn't able to figure out how to add the pairs together, and by calling
+    the sum() function directly, it added all the values in the vector together.
+    + I solved this by putting all my values in a matrix defined by 2 columns.
+    The first column was the first index after the %, and the second column was
+    the second index after the %. I called rowSums() on the matrix, and the 
+    result was a list of summed pairs.
+* Warning: setdiff(1:out, non_pc)
+    + This gave a warning stating numerical expression has 52 elements, only 
+    the first used.
+    + I solved this by replacing out, which is a raw list, to length(x), which
+    gives an integer. out has the same length as x, but was converted to raw
+    in the beginning to store raw values.
+    
+
+## All Runtime Plots
+We return all the times as a dataframe by size of input.
+```{r}
+tm1 = readRDS("tm1.rds")
+tm2 = readRDS("tm2.rds")
+tm1_df = data.frame(size=i, time=tm1)
+tm2_df = data.frame(size=i, time=tm2)
+
+tm_tbl = cbind(tm0_df$size, tm0_df$time, tm1_df$time, tm2_df$time)
+colnames(tm_tbl) = c("size", "url time", "preallocated time", "vectorized time")
+tm_df = as.data.frame(tm_tbl)
+
+tm_df
+```
+
+Then, we plot:
+```{r}
+colors <- c("URLdecode()"="cadetblue4", 
+            "preallocated()"="darkolivegreen", 
+            "vectorized()"="pink3")
+
+ggplot(tm_df, aes(x=`size`)) +
+    geom_line(aes(y=`url time`, color="URLdecode() time")) +
+    geom_line(aes(y=`preallocated time`, color="preallocated time")) +
+    geom_line(aes(y=`vectorized time`, color="vectorized time")) +
+    labs(x="size (n)",
+         y="time (seconds)",
+         color="legend") +
+    scale_color_manual(values=colors)
+```
+As we can see, our vectorized and preallocated functions return linear time.
+vectorized() outperforms URLdecode() and preallocated() since it has the
+smallest slope. However, we can notice that preallocated() and vectorized()
+are both very close in run-time.
+
+## 591K %-Encoded String
+```{r}
+readRDS("url_591k.rds")
+readRDS("pre_591k.rds")
+readRDS("v_591k.rds")
+```
+My estimate of the run-time for URLdecode() was pretty accurate because
+it shows a quadratic run-time, and the run-time for the 591K string falls on
+the quadratic curve.  
+The vectorized function is the fastest, as expected.
+
